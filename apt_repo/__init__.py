@@ -55,19 +55,15 @@ def _download_compressed(base_url):
 
 
 def _get_value(content, key):
-    """
-    Extracts a value from a Packages,Release file
-
-    # Arguments
-    content (str): the content of the Packages/Release file
-    key (str): the key to return the value for
-    """
-    pattern = key + ': (.*)\n'
-    match = re.search(pattern, content)
+    match = re.search(r'^' + key + ': (.*)$', content, flags=re.MULTILINE)
     try:
         return match.group(1)
     except AttributeError:
         raise KeyError(content, key)
+
+
+def version_as_tuple(version):
+    return tuple(re.findall(r'\d+(?=\.)|(?<=\.)\d+', version))
 
 
 class ReleaseFile:
@@ -140,6 +136,34 @@ class PackagesFile:
         return packages
 
 
+class BinaryPackageDependency():
+    def __init__(self, content):
+        try:
+            self.package_name, constraint_version = content.strip().split(' ', maxsplit=1)
+            self.constraint, self.version = constraint_version[1:-1].split(' ')
+        except ValueError:
+            self.package_name = content.strip()
+            self.constraint = self.version = None
+
+    def fulfilled(self, package):
+        """Checks if package fulfills this Dependency."""
+        if self.package_name != package.package:
+            return False
+        if self.constraint is None:
+            return True
+        if self.constraint == '>=':
+            return version_as_tuple(package.version) >= version_as_tuple(self.version)
+        elif self.constraint == '=':
+            return version_as_tuple(package.version) == version_as_tuple(self.version)
+        return False
+
+    def __str__(self):
+        return '{} ({} {})'.format(self.package_name, self.constraint, self.version)
+
+    def __repr__(self):
+        return str(self)
+
+
 class BinaryPackage:
     """
     Class that represents a binary Debian package
@@ -163,6 +187,34 @@ class BinaryPackage:
     def filename(self):
         return _get_value(self.__content, 'Filename')
 
+    @property
+    def depends(self):
+        try:
+            return [BinaryPackageDependency(s) for s in _get_value(self.__content, 'Depends').split(',')]
+        except KeyError:
+            return []
+
+    @property
+    def architecture(self):
+        return _get_value(self.__content, 'Architecture')
+
+    def dependencies(self, repos, summed_deps=None):
+        if summed_deps is None:
+            summed_deps = set()
+        summed_deps.add(self)
+        for dep in self.depends:
+            for rep in repos:
+                for pack in rep.get_binary_packages(dep.package_name):
+                    if pack not in summed_deps and dep.fulfilled(pack):
+                        pack.dependencies(repos, summed_deps)
+        return summed_deps
+
+    def __str__(self):
+        return '{} {} {}'.format(self.package, self.architecture, self.version)
+
+    def __repr__(self):
+        return str(self)
+
 
 class APTRepository:
     """
@@ -178,10 +230,11 @@ class APTRepository:
     APTRepository('http://archive.ubuntu.com/ubuntu', 'bionic', 'main')
     ```
     """
-    def __init__(self, url, dist, components):
+    def __init__(self, url, dist, components, architectures=['amd64', 'i386']):
         self.__url = url
         self.__dist = dist
         self.__components = components
+        self.__architectures = architectures
 
     def __getitem__(self, item):
         return self.get_packages_by_name(item)
@@ -229,18 +282,15 @@ class APTRepository:
         return ReleaseFile(release_content)
 
     @property
-    def packages(self, arch='amd64'):
-        """
-        Returns all binary packages of this repository
+    def packages(self):
+        if hasattr(self, '_packages'):
+            return self._packages
+        self._packages = []
+        for arch in self.__architectures:
+            for component in self.__components:
+                self._packages.extend(self.get_binary_packages_by_component(component, arch))
 
-        # Arguments
-        arch (str): the architecture to return packages for, default: 'amd64'
-        """
-        packages = []
-        for component in self.__components:
-            packages.extend(self.get_binary_packages_by_component(component, arch))
-
-        return packages
+        return self._packages
 
     def get_binary_packages_by_component(self, component, arch='amd64'):
         """
@@ -304,6 +354,9 @@ class APTRepository:
                 packages.append(package)
 
         return packages
+
+    def get_binary_packages(self, name, version=None):
+        return [p for p in self.packages if p.package == name and ((version and p.version.startswith(version)) or version is None)]
 
 
 class APTSources:
