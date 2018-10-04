@@ -5,6 +5,7 @@ import os
 import re
 import urllib.error
 import urllib.request as request
+import pydpkg
 
 
 def __download_raw(url):
@@ -62,9 +63,6 @@ def _get_value(content, key):
         raise KeyError(content, key)
 
 
-def version_as_tuple(version):
-    return tuple(re.findall(r'\d+(?=\.)|(?<=\.)\d+', version))
-
 
 class ReleaseFile:
     """
@@ -74,43 +72,43 @@ class ReleaseFile:
     content (str): the content of the Release file
     """
     def __init__(self, content):
-        self.__content = content.strip()
+        self.content = content.strip()
 
     @property
     def origin(self):
-        return _get_value(self.__content, 'Origin')
+        return _get_value(self.content, 'Origin')
 
     @property
     def label(self):
-        return _get_value(self.__content, 'Label')
+        return _get_value(self.content, 'Label')
 
     @property
     def suite(self):
-        return _get_value(self.__content, 'Suite')
+        return _get_value(self.content, 'Suite')
 
     @property
     def version(self):
-        return _get_value(self.__content, 'Version')
+        return _get_value(self.content, 'Version')
 
     @property
     def codename(self):
-        return _get_value(self.__content, 'Codename')
+        return _get_value(self.content, 'Codename')
 
     @property
     def date(self):
-        return _get_value(self.__content, 'Date')
+        return _get_value(self.content, 'Date')
 
     @property
     def architectures(self):
-        return _get_value(self.__content, 'Architectures').split()
+        return _get_value(self.content, 'Architectures').split()
 
     @property
     def components(self):
-        return _get_value(self.__content, 'Components').split()
+        return _get_value(self.content, 'Components').split()
 
     @property
     def description(self):
-        return _get_value(self.__content, 'Description')
+        return _get_value(self.content, 'Description')
 
 
 class PackagesFile:
@@ -120,18 +118,19 @@ class PackagesFile:
     # Arguments
     content (str): the content of the Packages file
     """
-    def __init__(self, content):
-        self.__content = content.strip()
+    def __init__(self, content, repository):
+        self.content = content.strip()
+        self.repository = repository
 
     @property
     def packages(self):
         """Returns all binary packages in this Packages files"""
         packages = []
-        for package_content in self.__content.split('\n\n'):
+        for package_content in self.content.split('\n\n'):
             if not package_content:
                 continue
 
-            packages.append(BinaryPackage(package_content))
+            packages.append(BinaryPackage(package_content, self.repository))
 
         return packages
 
@@ -152,9 +151,9 @@ class BinaryPackageDependency():
         if self.constraint is None:
             return True
         if self.constraint == '>=':
-            return version_as_tuple(package.version) >= version_as_tuple(self.version)
+            return pydpkg.Dpkg.compare_versions(package.version, self.version) >= 0
         elif self.constraint == '=':
-            return version_as_tuple(package.version) == version_as_tuple(self.version)
+            return pydpkg.Dpkg.compare_versions(package.version, self.version) == 0
         return False
 
     def __str__(self):
@@ -172,31 +171,40 @@ class BinaryPackage:
     # Arguments
     content (str): the section of the Packages file for this specific package
     """
-    def __init__(self, content):
-        self.__content = content.strip()
+    def __init__(self, content, repository):
+        self.content = content.strip()
+        self.repository = repository
 
     @property
     def package(self):
-        return _get_value(self.__content, 'Package')
+        return _get_value(self.content, 'Package')
 
     @property
     def version(self):
-        return _get_value(self.__content, 'Version')
+        return _get_value(self.content, 'Version')
 
     @property
     def filename(self):
-        return _get_value(self.__content, 'Filename')
+        return _get_value(self.content, 'Filename')
+
+    @property
+    def sha1(self):
+        return _get_value(self.content, 'SHA1')
 
     @property
     def depends(self):
         try:
-            return [BinaryPackageDependency(s) for s in _get_value(self.__content, 'Depends').split(',')]
+            return [BinaryPackageDependency(s) for s in _get_value(self.content, 'Depends').split(',')]
         except KeyError:
             return []
 
     @property
     def architecture(self):
-        return _get_value(self.__content, 'Architecture')
+        return _get_value(self.content, 'Architecture')
+
+    @property
+    def size(self):
+        return int(_get_value(self.content, 'Size'))
 
     def dependencies(self, repos, summed_deps=None):
         if summed_deps is None:
@@ -231,10 +239,10 @@ class APTRepository:
     ```
     """
     def __init__(self, url, dist, components, architectures=['amd64', 'i386']):
-        self.__url = url
-        self.__dist = dist
-        self.__components = components
-        self.__architectures = architectures
+        self.url = url
+        self.dist = dist
+        self.components = components
+        self.architectures = architectures
 
     def __getitem__(self, item):
         return self.get_packages_by_name(item)
@@ -258,11 +266,6 @@ class APTRepository:
         return APTRepository(url, dist, components)
 
     @property
-    def components(self):
-        """Returns the selected components of this repository"""
-        return self.__components
-
-    @property
     def all_components(self):
         """Returns the all components of this repository"""
         return self.release_file.components
@@ -270,14 +273,17 @@ class APTRepository:
     @property
     def release_file(self):
         """Returns the Release file of this repository"""
-        url = os.path.join(
-            self.__url,
+        url = '/'.join([
+            self.url,
             'dists',
-            self.__dist,
+            self.dist,
             'Release'
-        )
+        ])
 
         release_content = _download(url)
+
+        if release_content is None:
+            raise urllib.error.URLError('No release file found under "{}"'.format(url))
 
         return ReleaseFile(release_content)
 
@@ -286,8 +292,8 @@ class APTRepository:
         if hasattr(self, '_packages'):
             return self._packages
         self._packages = []
-        for arch in self.__architectures:
-            for component in self.__components:
+        for arch in self.architectures:
+            for component in self.components:
                 self._packages.extend(self.get_binary_packages_by_component(component, arch))
 
         return self._packages
@@ -300,18 +306,21 @@ class APTRepository:
         component (str): the component to return packages for
         arch (str): the architecture to return packages for, default: 'amd64'
         """
-        url = os.path.join(
-            self.__url,
+        url = '/'.join([
+            self.url,
             'dists',
-            self.__dist,
+            self.dist,
             component,
             'binary-' + arch,
             'Packages'
-        )
+        ])
 
         packages_file = _download_compressed(url)
 
-        return PackagesFile(packages_file).packages
+        if packages_file is None:
+            raise urllib.error.URLError('No release file found under "{}"'.format(url))
+
+        return PackagesFile(packages_file, self).packages
 
     def get_package(self, name, version):
         """
@@ -337,7 +346,7 @@ class APTRepository:
         """
         package = self.get_package(name, version)
 
-        return os.path.join(self.__url, package.filename)
+        return os.path.join(self.url, package.filename)
 
     def get_packages_by_name(self, name):
         """
@@ -367,7 +376,7 @@ class APTSources:
     repositories (list): list of APTRepository objects
     """
     def __init__(self, repositories):
-        self.__repositories = repositories
+        self.repositories = repositories
 
     def __getitem__(self, item):
         return self.get_packages_by_name(item)
@@ -377,7 +386,7 @@ class APTSources:
         """Returns all binary packages of all APT repositories"""
         packages = []
 
-        for repo in self.__repositories:
+        for repo in self.repositories:
             packages.extend(repo.packages)
 
         return packages
@@ -390,7 +399,7 @@ class APTSources:
         name (str): the name of the package
         version (str): the version of the package
         """
-        for repo in self.__repositories:
+        for repo in self.repositories:
             try:
                 return repo.get_package(name, version)
             except KeyError:
@@ -406,7 +415,7 @@ class APTSources:
         name (str): the name of the package
         version (str): the version of the package
         """
-        for repo in self.__repositories:
+        for repo in self.repositories:
             try:
                 return repo.get_package_url(name, version)
             except KeyError:
@@ -424,7 +433,7 @@ class APTSources:
 
         packages = []
 
-        for repo in self.__repositories:
+        for repo in self.repositories:
             packages.extend(repo.get_packages_by_name(name))
 
         return packages
