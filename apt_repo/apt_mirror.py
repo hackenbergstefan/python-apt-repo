@@ -33,30 +33,31 @@ Description:
 
 class APTDependencyMirror:
 
-    def __init__(self, repositories):
-        self.repositories = repositories
+    def __init__(self, sources):
+        self.sources = sources
         self.packages_to_mirror = set()
 
-    def add_package(self, package):
+    def add_package(self, package, mirror_recommends=False):
         if isinstance(package, list):
             [self.add_package(p) for p in package]
         else:
+            package = BinaryPackageDependency(package)
             self._add_dependencies(package)
+            if mirror_recommends:
+                self._add_recommends(package)
 
-    def _add_dependencies(self, package):
-        if isinstance(package, str):
-            package_name = package
-        elif isinstance(package, BinaryPackageDependency):
-            package_name = package.package_name
+    def _add_recommends(self, package):
+        for pack in self.sources.get(package.package_name):
+            for dependency in map(BinaryPackageDependency, pack.recommends):
+                self.packages_to_mirror |= self.sources.packages_fulfilling(dependency)
+
+    def _add_dependencies(self, package: BinaryPackageDependency):
+        package_name = package.package_name
 
         logging.getLogger(__name__).info('Adding top level package "{}"'.format(package))
 
-        for rep in self.repositories:
-            for pack in rep.get_binary_packages(package_name):
-                if isinstance(package, str):
-                    self.packages_to_mirror |= pack.dependencies(self.repositories)
-                elif isinstance(package, BinaryPackageDependency) and package.fulfilled(pack):
-                    self.packages_to_mirror |= pack.dependencies(self.repositories)
+        for pack in self.sources.get(package_name):
+            self.packages_to_mirror |= pack.dependencies(self.sources)
 
     def create(self, location, dist, component):
         self._create_packages_file(location, dist, component)
@@ -65,8 +66,7 @@ class APTDependencyMirror:
 
     def _create_packages_file(self, location, dist, component):
         packages_files = []
-        architectures = set(sum([rep.architectures for rep in self.repositories], []))
-        for arch in architectures:
+        for arch in self.sources.architectures:
             packfile = os.path.join(location, 'dists', dist, component, 'binary-' + arch, 'Packages')
             packages_files.append(packfile)
             mkdirs_if_not_exist(packfile)
@@ -80,7 +80,7 @@ class APTDependencyMirror:
                 label='',
                 dist=dist,
                 date=datetime.datetime.strftime(datetime.datetime.now(), '%a, %d %b %Y %H:%M:%S %z'),
-                architectures=' '.join(architectures),
+                architectures=' '.join(self.sources.architectures),
                 components=component
             ) + '\n')
             fp.write('SHA1:\n')

@@ -2,14 +2,14 @@
 
 import logging
 import sys
-from apt_repo import APTRepository, BinaryPackageDependency
+from apt_repo import APTRepository, BinaryPackageDependency, APTSources
 from apt_repo.apt_mirror import APTDependencyMirror
 
-reps = [
-    APTRepository('http://de.archive.ubuntu.com/ubuntu', 'bionic-updates', ['main'], ['i386']),
-    APTRepository('http://de.archive.ubuntu.com/ubuntu', 'bionic', ['main'], ['i386']),
+sources = APTSources([
+    APTRepository('http://de.archive.ubuntu.com/ubuntu', 'bionic-updates', ['main', 'universe'], ['i386']),
+    APTRepository('http://de.archive.ubuntu.com/ubuntu', 'bionic', ['main', 'universe'], ['i386']),
     APTRepository('https://dl.winehq.org/wine-builds/ubuntu', 'bionic', ['main']),
-]
+])
 
 
 def main2():
@@ -28,11 +28,10 @@ def main3():
 
 def main4():
     logging.basicConfig(level=logging.DEBUG)
-    mirror = APTDependencyMirror(reps)
-    mirror.add_package(BinaryPackageDependency('wine-stable (>= 3.0.3)'))
-    #mirror.add_package(BinaryPackageDependency('libgphoto2-port12'))
+    mirror = APTDependencyMirror(sources)
+    mirror.add_package('winehq-stable (>= 3.0.3)', mirror_recommends=True)
     print(mirror.packages_to_mirror)
-    mirror.create('E:/mymirror', 'bionic', 'main')
+    mirror.create('E:/mymirror', 'local-bionic', 'main')
 
 
 if __name__ == '__main__':
