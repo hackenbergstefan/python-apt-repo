@@ -137,15 +137,21 @@ class PackagesFile:
 
 class BinaryPackageDependency():
     def __init__(self, content):
-        try:
-            self.package_name, constraint_version = content.strip().split(' ', maxsplit=1)
-            self.constraint, self.version = constraint_version[1:-1].split(' ')
-        except ValueError:
-            self.package_name = content.strip()
-            self.constraint = self.version = None
+        if '|' in content:
+            self.or_dependencies = [BinaryPackageDependency(d) for d in content.split(' | ')]
+            self.package_name = [d.package_name for d in self.or_dependencies]
+        else:
+            try:
+                self.package_name, constraint_version = content.strip().split(' ', maxsplit=1)
+                self.constraint, self.version = constraint_version[1:-1].split(' ')
+            except ValueError:
+                self.package_name = content.strip()
+                self.constraint = self.version = None
 
     def fulfilled(self, package):
         """Checks if package fulfills this Dependency."""
+        if hasattr(self, 'or_dependencies'):
+            return any([d.fulfilled(package) for d in self.or_dependencies])
         if self.package_name != package.package:
             return False
         if self.constraint is None:
@@ -154,9 +160,13 @@ class BinaryPackageDependency():
             return pydpkg.Dpkg.compare_versions(package.version, self.version) >= 0
         elif self.constraint == '=':
             return pydpkg.Dpkg.compare_versions(package.version, self.version) == 0
+        elif self.constraint == '<<':
+            return pydpkg.Dpkg.compare_versions(package.version, self.version) < 0
         return False
 
     def __str__(self):
+        if hasattr(self, 'or_dependencies'):
+            return ' | '.join([str(d) for d in self.or_dependencies])
         return '{} ({} {})'.format(self.package_name, self.constraint, self.version)
 
     def __repr__(self):
@@ -188,6 +198,13 @@ class BinaryPackage:
         return _get_value(self.content, 'Filename')
 
     @property
+    def recommends(self):
+        try:
+            return _get_value(self.content, 'Recommends')
+        except KeyError:
+            return []
+
+    @property
     def sha1(self):
         return _get_value(self.content, 'SHA1')
 
@@ -199,6 +216,13 @@ class BinaryPackage:
             return []
 
     @property
+    def predepends(self):
+        try:
+            return [BinaryPackageDependency(s) for s in _get_value(self.content, 'Pre-Depends').split(',')]
+        except KeyError:
+            return []
+
+    @property
     def architecture(self):
         return _get_value(self.content, 'Architecture')
 
@@ -206,15 +230,19 @@ class BinaryPackage:
     def size(self):
         return int(_get_value(self.content, 'Size'))
 
-    def dependencies(self, repos, summed_deps=None):
+    def dependencies(self, sources, summed_deps=None):
         if summed_deps is None:
             summed_deps = set()
         summed_deps.add(self)
-        for dep in self.depends:
-            for rep in repos:
-                for pack in rep.get_binary_packages(dep.package_name):
-                    if pack not in summed_deps and dep.fulfilled(pack):
-                        pack.dependencies(repos, summed_deps)
+        for dep in self.depends + self.predepends:
+            if len([p for p in summed_deps if dep.fulfilled(p)]) > 0:
+                continue
+            packs_fulfilling = []
+            for pack in sources.packages_fulfilling(dep):
+                packs_fulfilling.append(pack)
+                pack.dependencies(sources, summed_deps)
+            if len(packs_fulfilling) == 0:
+                raise Exception('No package found matching "%s"', dep)
         return summed_deps
 
     def __str__(self):
@@ -244,8 +272,8 @@ class APTRepository:
         self.components = components
         self.architectures = architectures
 
-    def __getitem__(self, item):
-        return self.get_packages_by_name(item)
+    def get(self, item):
+        return self.packages.get(item, [])
 
     @staticmethod
     def from_sources_list_entry(entry):
@@ -291,10 +319,15 @@ class APTRepository:
     def packages(self):
         if hasattr(self, '_packages'):
             return self._packages
-        self._packages = []
+        self._packages = {}
         for arch in self.architectures:
             for component in self.components:
-                self._packages.extend(self.get_binary_packages_by_component(component, arch))
+                packs = self.get_binary_packages_by_component(component, arch)
+                for pack in packs:
+                    if pack.package in self._packages:
+                        self._packages[pack.package].append(pack)
+                    else:
+                        self._packages[pack.package] = [pack]
 
         return self._packages
 
@@ -322,50 +355,16 @@ class APTRepository:
 
         return PackagesFile(packages_file, self).packages
 
-    def get_package(self, name, version):
-        """
-        Returns a single binary package
-
-        # Arguments
-        name (str): name of the package
-        version (str): version of the package
-        """
-        for package in self.packages:
-            if package.package == name and package.version == version:
-                return package
-
-        raise KeyError(name, version)
-
-    def get_package_url(self, name, version):
-        """
-        Returns the URL for a single binary package
-
-        # Arguments
-        name (str): name of the package
-        version (str): version of the package
-        """
-        package = self.get_package(name, version)
-
-        return os.path.join(self.url, package.filename)
-
-    def get_packages_by_name(self, name):
-        """
-        Returns the list of available packages (and it's available versions) for a specific package name
-
-        # Arguments
-        name (str): name of the package
-        """
-
-        packages = []
-
-        for package in self.packages:
-            if package.package == name:
-                packages.append(package)
-
-        return packages
-
     def get_binary_packages(self, name, version=None):
-        return [p for p in self.packages if p.package == name and ((version and p.version.startswith(version)) or version is None)]
+        return [p for p in self.packages.get(name, []) if ((version and p.version.startswith(version)) or version is None)]
+
+    def packages_fulfilling(self, dependency):
+        names = dependency.package_name
+        if isinstance(names, str):
+            names = [names]
+        for pack in sum([self.packages.get(n, []) for n in names], []):
+            if dependency.fulfilled(pack):
+                yield pack
 
 
 class APTSources:
@@ -378,62 +377,13 @@ class APTSources:
     def __init__(self, repositories):
         self.repositories = repositories
 
-    def __getitem__(self, item):
-        return self.get_packages_by_name(item)
+    def get(self, name):
+        return set(sum([rep.get(name) for rep in self.repositories], []))
 
     @property
-    def packages(self):
-        """Returns all binary packages of all APT repositories"""
-        packages = []
+    def architectures(self):
+        return set(sum([rep.architectures for rep in self.repositories], []))
 
-        for repo in self.repositories:
-            packages.extend(repo.packages)
-
-        return packages
-
-    def get_package(self, name, version):
-        """
-        Returns a single binary package
-
-        # Arguments
-        name (str): the name of the package
-        version (str): the version of the package
-        """
-        for repo in self.repositories:
-            try:
-                return repo.get_package(name, version)
-            except KeyError:
-                pass
-
-        raise KeyError(name, version)
-
-    def get_package_url(self, name, version):
-        """
-        Returns the URL of a single binary package
-
-        # Arguments
-        name (str): the name of the package
-        version (str): the version of the package
-        """
-        for repo in self.repositories:
-            try:
-                return repo.get_package_url(name, version)
-            except KeyError:
-                pass
-
-        raise KeyError(name, version)
-
-    def get_packages_by_name(self, name):
-        """
-        Returns the list of available packages (and it's available versions) for a specific package name
-
-        # Arguments
-        name (str): name of the package
-        """
-
-        packages = []
-
-        for repo in self.repositories:
-            packages.extend(repo.get_packages_by_name(name))
-
-        return packages
+    def packages_fulfilling(self, dependency):
+        for rep in self.repositories:
+            yield from rep.packages_fulfilling(dependency)
