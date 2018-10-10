@@ -2,7 +2,6 @@ import bz2
 import logging
 import gzip
 import lzma
-import os
 import re
 import urllib.error
 import urllib.request as request
@@ -52,7 +51,7 @@ def _download_compressed(base_url):
             req = request.urlopen(url)
         except urllib.error.URLError:
             continue
-        logging.getLogger(__name__).debug('Download "{}"'.format(url))
+        logging.getLogger(__name__).info('Download "{}"'.format(url))
 
         return method(req.read()).decode('utf-8')
 
@@ -63,7 +62,6 @@ def _get_value(content, key):
         return match.group(1)
     except AttributeError:
         raise KeyError(content, key)
-
 
 
 class ReleaseFile:
@@ -252,7 +250,7 @@ class BinaryPackage:
         if summed_deps is None:
             summed_deps = set()
         summed_deps.add(self)
-        logging.getLogger(__name__).debug('Check dependencies of {}'.format(self.package))
+        logging.getLogger(__name__).debug('Check dependencies of {}'.format(self))
         for dep in self.depends + self.predepends:
             if len([p for p in summed_deps if dep.fulfilled(p)]) > 0:
                 continue
@@ -418,6 +416,12 @@ class APTSources:
     @property
     def architectures(self):
         return set(sum([rep.architectures for rep in self.repositories], []))
+
+    @property
+    def packages(self):
+        for rep in self.repositories:
+            for packs in rep.packages.values():
+                yield from packs
 
     def packages_fulfilling(self, dependency):
         for rep in self.repositories:
