@@ -1,9 +1,11 @@
 import datetime
+import gzip
+import re
 import hashlib
 import logging
 import os
 import urllib.request
-from . import BinaryPackageDependency
+from . import BinaryPackageDependency, __download_raw
 
 
 def mkdirs_if_not_exist(filename):
@@ -20,31 +22,55 @@ def sha1file(filename):
     return sha1.hexdigest()
 
 
-apt_release_file_template = """Origin: local
-Label: {label}
-Suite: {dist}
-Codename: {dist}
-Date: {date}
-Architectures: {architectures}
-Components: {components}
-Description:
-"""
+def download(remote, local):
+    logging.getLogger(__name__).debug('Download "{}" -> "{}"'.format(remote, local))
+    mkdirs_if_not_exist(local)
+    download_content = urllib.request.urlopen(remote).read()
+    with open(local, 'wb') as fp:
+        fp.write(download_content)
+
+
+def _topath(url):
+    return re.sub(r'https?://', '', url)
 
 
 class APTDependencyMirror:
 
-    def __init__(self, sources):
+    def __init__(self, sources, location):
         self.sources = sources
+        self.location = location
         self.packages_to_mirror = set()
 
-    def add_package(self, package, mirror_recommends=False):
+    def create(self):
+        self._mirror_metafiles()
+        for pack in self.packages_to_mirror:
+            self._mirror_package(pack)
+
+    def _mirror_metafiles(self):
+        for repo in self.sources.repositories:
+            for fil in ['Release', 'Release.gpg', 'InRelease']:
+                download(
+                    '/'.join([repo.url, 'dists', repo.dist, fil]),
+                    os.path.join(self.location, _topath(repo.url), 'dists', repo.dist, fil)
+                )
+            for component in repo.components:
+                for architecture in repo.architectures:
+                    for fil in ['Packages', 'Packages.gz', 'Release']:
+                        try:
+                            url = '/'.join([repo.url, 'dists', repo.dist, component, 'binary-' + architecture, fil])
+                            download(
+                                url,
+                                os.path.join(self.location, _topath(repo.url), 'dists', repo.dist, component, 'binary-' + architecture, fil)
+                            )
+                        except urllib.error.HTTPError:
+                            logging.getLogger(__name__).warning('URL not found: "{}"'.format(url))
+
+    def add_package(self, package):
         if isinstance(package, list):
             [self.add_package(p) for p in package]
         else:
             package = BinaryPackageDependency(package)
             self._add_dependencies(package)
-            if mirror_recommends:
-                self._add_recommends(package)
 
     def _add_recommends(self, package):
         for pack in self.sources.get(package.package_name):
@@ -59,49 +85,13 @@ class APTDependencyMirror:
         for pack in self.sources.get(package_name):
             self.packages_to_mirror |= pack.dependencies(self.sources)
 
-    def create(self, location, dist, component):
-        self._create_packages_file(location, dist, component)
-        for package in self.packages_to_mirror:
-            self._download_package(location, package)
-
-    def _create_packages_file(self, location, dist, component):
-        packages_files = []
-        for arch in self.sources.architectures:
-            packfile = os.path.join(location, 'dists', dist, component, 'binary-' + arch, 'Packages')
-            packages_files.append(packfile)
-            mkdirs_if_not_exist(packfile)
-            with open(packfile, 'w') as fp:
-                for pack in [p for p in self.packages_to_mirror if p.architecture == arch]:
-                    fp.write(pack.content + '\n\n')
-
-        release_file = os.path.join(location, 'dists', dist, 'Release')
-        with open(release_file, 'w') as fp:
-            fp.write(apt_release_file_template.format(
-                label='',
-                dist=dist,
-                date=datetime.datetime.strftime(datetime.datetime.now(), '%a, %d %b %Y %H:%M:%S %z'),
-                architectures=' '.join(self.sources.architectures),
-                components=component
-            ) + '\n')
-            fp.write('SHA1:\n')
-            for packfile in packages_files:
-                fp.write(' {} {} {}\n'.format(
-                    sha1file(packfile),
-                    os.stat(packfile).st_size,
-                    os.path.relpath(packfile, os.path.dirname(release_file)).replace(os.path.sep, '/')
-                ))
-
-    def _download_package(self, location, package):
+    def _mirror_package(self, package):
         download_url = package.repository.url + '/' + package.filename
-        filename = os.path.join(location, *package.filename.split('/'))
+        filename = os.path.join(self.location, _topath(package.repository.url), *package.filename.split('/'))
 
         logging.getLogger(__name__).info('Download {} from "{}" to "{}"'.format(package, download_url, filename))
 
-        mkdirs_if_not_exist(filename)
-
         if not os.path.exists(filename):
-            download_content = urllib.request.urlopen(download_url).read()
-            with open(filename, 'wb') as fp:
-                fp.write(download_content)
+            download(download_url, filename)
 
         assert sha1file(filename) == package.sha1, 'Corrupt file: {}'.format(filename)

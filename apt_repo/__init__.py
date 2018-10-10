@@ -1,4 +1,5 @@
 import bz2
+import logging
 import gzip
 import lzma
 import os
@@ -51,6 +52,7 @@ def _download_compressed(base_url):
             req = request.urlopen(url)
         except urllib.error.URLError:
             continue
+        logging.getLogger(__name__).debug('Download "{}"'.format(url))
 
         return method(req.read()).decode('utf-8')
 
@@ -136,23 +138,21 @@ class PackagesFile:
 
 
 class BinaryPackageDependency():
+    re_dependency = re.compile(r'^(?P<package_name>\S+?)(?::(?P<architecture>\S+))?(?: \((?P<constraint>>>|<<|>=|=) (?P<version>\S+)\))?$')
+
     def __init__(self, content):
         if '|' in content:
             self.or_dependencies = [BinaryPackageDependency(d) for d in content.split(' | ')]
             self.package_name = [d.package_name for d in self.or_dependencies]
         else:
-            try:
-                self.package_name, constraint_version = content.strip().split(' ', maxsplit=1)
-                self.constraint, self.version = constraint_version[1:-1].split(' ')
-            except ValueError:
-                self.package_name = content.strip()
-                self.constraint = self.version = None
+            for k, v in self.re_dependency.match(content.strip()).groupdict().items():
+                setattr(self, k, v)
 
     def fulfilled(self, package):
         """Checks if package fulfills this Dependency."""
         if hasattr(self, 'or_dependencies'):
             return any([d.fulfilled(package) for d in self.or_dependencies])
-        if self.package_name != package.package:
+        if self.package_name != package.package and self.package_name not in package.provides:
             return False
         if self.constraint is None:
             return True
@@ -162,6 +162,8 @@ class BinaryPackageDependency():
             return pydpkg.Dpkg.compare_versions(package.version, self.version) == 0
         elif self.constraint == '<<':
             return pydpkg.Dpkg.compare_versions(package.version, self.version) < 0
+        elif self.constraint == '>>':
+            return pydpkg.Dpkg.compare_versions(package.version, self.version) > 0
         return False
 
     def __str__(self):
@@ -198,6 +200,16 @@ class BinaryPackage:
         return _get_value(self.content, 'Filename')
 
     @property
+    def provides(self):
+        if hasattr(self, '_cache_provides'):
+            return self._cache_provides
+        try:
+            self._cache_provides = [p.strip() for p in _get_value(self.content, 'Provides').split(',')]
+        except KeyError:
+            self._cache_provides = []
+        return self._cache_provides
+
+    @property
     def recommends(self):
         try:
             return _get_value(self.content, 'Recommends')
@@ -210,17 +222,23 @@ class BinaryPackage:
 
     @property
     def depends(self):
+        if hasattr(self, '_cache_depends'):
+            return self._cache_depends
         try:
-            return [BinaryPackageDependency(s) for s in _get_value(self.content, 'Depends').split(',')]
+            self._cache_depends = [BinaryPackageDependency(s) for s in _get_value(self.content, 'Depends').split(',')]
         except KeyError:
-            return []
+            self._cache_depends = []
+        return self._cache_depends
 
     @property
     def predepends(self):
+        if hasattr(self, '_cache_predepends'):
+            return self._cache_predepends
         try:
-            return [BinaryPackageDependency(s) for s in _get_value(self.content, 'Pre-Depends').split(',')]
+            self._cache_predepends = [BinaryPackageDependency(s) for s in _get_value(self.content, 'Pre-Depends').split(',')]
         except KeyError:
-            return []
+            self._cache_predepends = []
+        return self._cache_predepends
 
     @property
     def architecture(self):
@@ -234,6 +252,7 @@ class BinaryPackage:
         if summed_deps is None:
             summed_deps = set()
         summed_deps.add(self)
+        logging.getLogger(__name__).debug('Check dependencies of {}'.format(self.package))
         for dep in self.depends + self.predepends:
             if len([p for p in summed_deps if dep.fulfilled(p)]) > 0:
                 continue
@@ -242,7 +261,8 @@ class BinaryPackage:
                 packs_fulfilling.append(pack)
                 pack.dependencies(sources, summed_deps)
             if len(packs_fulfilling) == 0:
-                raise Exception('No package found matching "%s"', dep)
+                logging.getLogger(__name__).warning('No package found matching "{}"'.format(dep))
+                # raise Exception('No package found matching "{}"'.format(dep))
         return summed_deps
 
     def __str__(self):
@@ -274,6 +294,11 @@ class APTRepository:
 
     def get(self, item):
         return self.packages.get(item, [])
+
+    def get_provided(self, item):
+        if not hasattr(self, '_cache_provided_packages'):
+            packs = self.packages
+        return self._cache_provided_packages.get(item, [])
 
     @staticmethod
     def from_sources_list_entry(entry):
@@ -317,19 +342,28 @@ class APTRepository:
 
     @property
     def packages(self):
-        if hasattr(self, '_packages'):
-            return self._packages
-        self._packages = {}
+        if hasattr(self, '_cache_packages'):
+            return self._cache_packages
+        self._cache_packages = {}
         for arch in self.architectures:
             for component in self.components:
                 packs = self.get_binary_packages_by_component(component, arch)
                 for pack in packs:
-                    if pack.package in self._packages:
-                        self._packages[pack.package].append(pack)
+                    if pack.package in self._cache_packages:
+                        self._cache_packages[pack.package].append(pack)
                     else:
-                        self._packages[pack.package] = [pack]
+                        self._cache_packages[pack.package] = [pack]
 
-        return self._packages
+        self._cache_provided_packages = {}
+        for name, packs in self._cache_packages.items():
+            for pack in packs:
+                for provides in [name] + pack.provides:
+                    if provides in self._cache_provided_packages:
+                        self._cache_provided_packages[provides].add(pack)
+                    else:
+                        self._cache_provided_packages[provides] = {pack}
+
+        return self._cache_packages
 
     def get_binary_packages_by_component(self, component, arch='amd64'):
         """
@@ -362,9 +396,10 @@ class APTRepository:
         names = dependency.package_name
         if isinstance(names, str):
             names = [names]
-        for pack in sum([self.packages.get(n, []) for n in names], []):
-            if dependency.fulfilled(pack):
-                yield pack
+        for name in names:
+            for pack in self.get_provided(name):
+                if dependency.fulfilled(pack):
+                    yield pack
 
 
 class APTSources:
