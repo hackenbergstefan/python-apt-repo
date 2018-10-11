@@ -83,7 +83,7 @@ class APTDependencyMirror:
                         except urllib.error.HTTPError:
                             logging.getLogger(__name__).warning('URL not found: "{}"'.format(url))
 
-    def _mirror_package(self, package):
+    def _mirror_package(self, package, retry_count=1):
         download_url = package.repository.url + '/' + package.filename
         filename = os.path.join(self.location, _topath(package.repository.url), *package.filename.split('/'))
 
@@ -92,7 +92,12 @@ class APTDependencyMirror:
         if not os.path.exists(filename):
             download(download_url, filename)
 
-        assert sha1file(filename) == package.sha1, 'Corrupt file: {}'.format(filename)
+        if sha1file(filename) != package.sha1:
+            if retry_count > 0:
+                os.remove(filename)
+                self._mirror_package(package, retry_count - 1)
+            else:
+                logging.getLogger(__name__).critical('Corrupt file "{}"'.format(filename))
 
 
 class FilterAddArchitectureFromUrl:
