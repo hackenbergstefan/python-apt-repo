@@ -28,7 +28,8 @@ def download(remote, local):
     mkdirs_if_not_exist(local)
     content = requests.get(remote, stream=True)
     if content.status_code != requests.codes['ok']:
-        raise requests.HTTPError(response=content)
+        logging.getLogger(__name__).warning('Response {} for URL: "{}"'.format(content.status_code, remote))
+        return
     with open(local, 'wb') as fp:
         for chunk in content.iter_content(chunk_size=1024):
             fp.write(chunk)
@@ -68,26 +69,18 @@ class APTDependencyMirror:
 
     def _mirror_metafiles(self):
         for repo in self.sources.repositories:
-            for hash, fil in repo.release_file.metafiles:
-                url = '/'.join([repo.url, 'dists', repo.dist, fil])
-                filename = os.path.join(self.location, _topath(repo.url), 'dists', repo.dist, fil)
-                try:
-                    download(url, filename)
-                    if shafile(filename, 'sha256') != hash:
-                        logging.getLogger(__name__).critical('Corrupt file "{}"'.format(filename))
-                except requests.HTTPError:
-                    logging.getLogger(__name__).warning('URL not found: "{}"'.format(url))
+            for fil in ['Release', 'Release.gpg', 'InRelease']:
+                download(
+                    '/'.join([repo.url, 'dists', repo.dist, fil]),
+                    os.path.join(self.location, _topath(repo.url), 'dists', repo.dist, fil)
+                )
             for component in repo.components:
                 for architecture in repo.architectures:
                     for fil in ['Packages', 'Packages.gz', 'Release']:
-                        try:
-                            url = '/'.join([repo.url, 'dists', repo.dist, component, 'binary-' + architecture, fil])
-                            download(
-                                url,
-                                os.path.join(self.location, _topath(repo.url), 'dists', repo.dist, component, 'binary-' + architecture, fil)
-                            )
-                        except requests.HTTPError:
-                            logging.getLogger(__name__).warning('URL not found: "{}"'.format(url))
+                        download(
+                            '/'.join([repo.url, 'dists', repo.dist, component, 'binary-' + architecture, fil]),
+                            os.path.join(self.location, _topath(repo.url), 'dists', repo.dist, component, 'binary-' + architecture, fil)
+                        )
 
     def _mirror_package(self, package, retry_count=1):
         download_url = package.repository.url + '/' + package.filename
