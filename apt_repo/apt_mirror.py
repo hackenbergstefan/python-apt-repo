@@ -13,20 +13,22 @@ def mkdirs_if_not_exist(filename):
         os.makedirs(os.path.dirname(filename))
 
 
-def sha1file(filename):
-    sha1 = hashlib.sha1()
+def shafile(filename, alg='sha1'):
+    sha = getattr(hashlib, alg)()
     with open(filename, 'rb') as fp:
         block = fp.read(2**16)
         while len(block) != 0:
-            sha1.update(block)
+            sha.update(block)
             block = fp.read(2**16)
-    return sha1.hexdigest()
+    return sha.hexdigest()
 
 
 def download(remote, local):
-    logging.getLogger(__name__).debug('Download "{}" -> "{}"'.format(remote, local))
+    logging.getLogger(__name__).info('Download "{}" -> "{}"'.format(remote, local))
     mkdirs_if_not_exist(local)
     content = requests.get(remote, stream=True)
+    if content.status_code != requests.codes['ok']:
+        raise requests.HTTPError(response=content)
     with open(local, 'wb') as fp:
         for chunk in content.iter_content(chunk_size=1024):
             fp.write(chunk)
@@ -66,11 +68,15 @@ class APTDependencyMirror:
 
     def _mirror_metafiles(self):
         for repo in self.sources.repositories:
-            for fil in ['Release', 'Release.gpg', 'InRelease']:
-                download(
-                    '/'.join([repo.url, 'dists', repo.dist, fil]),
-                    os.path.join(self.location, _topath(repo.url), 'dists', repo.dist, fil)
-                )
+            for hash, fil in repo.release_file.metafiles:
+                url = '/'.join([repo.url, 'dists', repo.dist, fil])
+                filename = os.path.join(self.location, _topath(repo.url), 'dists', repo.dist, fil)
+                try:
+                    download(url, filename)
+                    if shafile(filename, 'sha256') != hash:
+                        logging.getLogger(__name__).critical('Corrupt file "{}"'.format(filename))
+                except requests.HTTPError:
+                    logging.getLogger(__name__).warning('URL not found: "{}"'.format(url))
             for component in repo.components:
                 for architecture in repo.architectures:
                     for fil in ['Packages', 'Packages.gz', 'Release']:
@@ -80,7 +86,7 @@ class APTDependencyMirror:
                                 url,
                                 os.path.join(self.location, _topath(repo.url), 'dists', repo.dist, component, 'binary-' + architecture, fil)
                             )
-                        except urllib.error.HTTPError:
+                        except requests.HTTPError:
                             logging.getLogger(__name__).warning('URL not found: "{}"'.format(url))
 
     def _mirror_package(self, package, retry_count=1):
@@ -92,7 +98,7 @@ class APTDependencyMirror:
         if not os.path.exists(filename):
             download(download_url, filename)
 
-        if sha1file(filename) != package.sha1:
+        if shafile(filename) != package.sha1:
             if retry_count > 0:
                 os.remove(filename)
                 self._mirror_package(package, retry_count - 1)

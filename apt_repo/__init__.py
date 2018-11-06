@@ -6,6 +6,7 @@ import re
 import urllib.error
 import urllib.request as request
 import pydpkg
+from binascii import unhexlify
 
 
 def __download_raw(url):
@@ -109,6 +110,14 @@ class ReleaseFile:
     @property
     def description(self):
         return _get_value(self.content, 'Description')
+
+    @property
+    def metafiles(self):
+        match = re.search(r'^SHA256:\n((?: .+\n)+)', self.content, flags=re.MULTILINE)
+        if not match:
+            match = re.search(r'^MD5Sum:\n((?: .+\n)+)', self.content, flags=re.MULTILINE)
+        if match:
+            return [(unhexlify(hash), filename) for hash, filename in re.findall(r' (\w+)\s+\d+ (\S+)', match.group(1))]
 
 
 class PackagesFile:
@@ -324,12 +333,11 @@ class APTRepository:
     @property
     def release_file(self):
         """Returns the Release file of this repository"""
-        url = '/'.join([
-            self.url,
-            'dists',
-            self.dist,
-            'Release'
-        ])
+        url = '/'.join(
+            [self.url] +
+            (['dists', self.dist] if self.dist else []) +
+            ['Release']
+        )
 
         release_content = _download(url)
 
@@ -363,7 +371,7 @@ class APTRepository:
 
         return self._cache_packages
 
-    def get_binary_packages_by_component(self, component, arch='amd64'):
+    def get_binary_packages_by_component(self, component, arch, retry=3):
         """
         Returns all binary packages of this repository for a given component
 
@@ -371,16 +379,18 @@ class APTRepository:
         component (str): the component to return packages for
         arch (str): the architecture to return packages for, default: 'amd64'
         """
-        url = '/'.join([
-            self.url,
-            'dists',
-            self.dist,
-            component,
-            'binary-' + arch,
-            'Packages'
-        ])
+        url = '/'.join(
+            [self.url] +
+            (['dists', self.dist] if self.dist else []) +
+            [component] +
+            ['binary-' + arch if arch else 'binary'] +
+            ['Packages']
+        )
 
-        packages_file = _download_compressed(url)
+        for _ in range(retry):
+            packages_file = _download_compressed(url)
+            if packages_file is not None:
+                break
 
         if packages_file is None:
             raise urllib.error.URLError('No release file found under "{}"'.format(url))
